@@ -1,0 +1,4 @@
+alpaca-py
+arch
+pandas
+python-dotenv
