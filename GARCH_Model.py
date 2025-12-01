@@ -5,9 +5,10 @@ import pandas as pd
 from dotenv import load_dotenv
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 from arch import arch_model
+from typing import Final
 
 load_dotenv()
 def get_alpaca_client() -> StockHistoricalDataClient:
@@ -22,6 +23,8 @@ def get_alpaca_client() -> StockHistoricalDataClient:
 
     client = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
     return client
+
+DEFAULT_TIMEFRAME: Final[TimeFrame] = TimeFrame(1, TimeFrameUnit.Day)
 
 
 def fetch_price_data(
@@ -85,7 +88,8 @@ def fit_garch_model(returns: pd.Series):
         p=1,
         q=1,
         mean="Constant",
-        dist="normal",
+        # financial data is often fat-tailed
+        dist="t",
     )
 
     result = model.fit(disp="off")  # no verbose output
@@ -117,10 +121,12 @@ def garch_results():
     lookback_months = int(os.getenv("LB_MONTHS"))
     lookback_days = int(os.getenv("LB_DAYS"))
 
-    start = datetime(end.year - lookback_years, end.month - lookback_months, end.day - lookback_days)
+    start = (
+        pd.Timestamp(end) - pd.DateOffset(years=lookback_years, months=lookback_months, days=lookback_days)
+    ).to_pydatetime()
 
     print(f"Fetching data for {symbol} from {start.date()} to {end.date()}...")
-    price_df = fetch_price_data(symbol, start, end, timeframe=TimeFrame.Day)
+    price_df = fetch_price_data(symbol, start, end, timeframe=DEFAULT_TIMEFRAME)
     print(f"Got {len(price_df)} bars.")
     scale = float(os.getenv("SCALE"))
     returns = compute_returns(price_df, column="close")*scale
