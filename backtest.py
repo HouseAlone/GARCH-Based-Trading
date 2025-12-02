@@ -159,14 +159,18 @@ def run_backtest(symbols: List[str], start: datetime, end: datetime):
         df["symbol"] = symbol
         all_results.append(df)
         total_ret = (1 + df["pnl"]).prod() - 1
-        print(f"{symbol}: trades={len(df)}, total_return={total_ret:.4f}")
+        std_ret = df["pnl"].std()
+        var_5 = df["pnl"].quantile(0.05)
+        print(f"{symbol}: trades={len(df)}, total_return={total_ret:.4f}, std={std_ret:.4f}, VaR5%={var_5:.4f}")
     if not all_results:
         print("No results to show.")
         return
     merged = pd.concat(all_results, ignore_index=True)
     portfolio = merged.groupby("date")["pnl"].mean()
     equity_curve = (1 + portfolio).cumprod()
-    print(f"Portfolio final return: {equity_curve.iloc[-1] - 1:.4f}")
+    port_std = portfolio.std()
+    port_var5 = portfolio.quantile(0.05)
+    print(f"Portfolio final return: {equity_curve.iloc[-1] - 1:.4f}, std={port_std:.4f}, VaR5%={port_var5:.4f}")
     return merged, equity_curve
 
 
