@@ -15,11 +15,40 @@ from arch import arch_model
 
 load_dotenv()  # load env vars
 
-# simple universe to run
-UNIVERSE = ["AAPL", "MSFT", "SPY"]
+# small env helpers
+def env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, default))
+    except Exception:
+        return default
+
+
+def env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, default))
+    except Exception:
+        return default
+
 
 # default daily timeframe
 DEFAULT_TIMEFRAME: Final[TimeFrame] = TimeFrame(1, TimeFrameUnit.Day)
+
+# universe from env (comma-separated) with a default fallback
+UNIVERSE = [s.strip().upper() for s in os.getenv("UNIVERSE", "AAPL,MSFT,AMZN,GOOGL,META,NVDA,TSLA,JPM,V,HD,XOM,SPY,QQQ").split(",") if s.strip()]
+
+# shared tunables
+GARCH_P = env_int("GARCH_P", 1)
+GARCH_Q = env_int("GARCH_Q", 1)
+VOL_LOW_REL = env_float("VOL_LOW_REL", 0.8)
+VOL_HIGH_REL = env_float("VOL_HIGH_REL", 1.2)
+MR_LOOKBACK = env_int("MR_LOOKBACK", 20)
+MR_Z = env_float("MR_Z", -1.0)
+MOM_FAST = env_int("MOM_FAST", 12)
+MOM_SLOW = env_int("MOM_SLOW", 26)
+MOM_SIGNAL = env_int("MOM_SIGNAL", 9)
+TREND_SMA = env_int("TREND_SMA", 50)
+WEIGHT_LOW = env_float("WEIGHT_LOW", 0.02)
+WEIGHT_MED = env_float("WEIGHT_MED", 0.01)
 
 
 def get_alpaca_client() -> StockHistoricalDataClient:
@@ -38,6 +67,11 @@ def get_trading_client() -> TradingClient:
     if api_key is None or secret_key is None:
         raise ValueError("ALPACA_API_KEY or ALPACA_SECRET_KEY missing in .env")
     return TradingClient(api_key, secret_key, paper=True)
+
+
+def load_large_cap_universe() -> list:
+    # unused now that universe is fixed
+    return UNIVERSE
 
 
 def fetch_price_data(
@@ -76,8 +110,8 @@ def fit_garch_model(returns: pd.Series):
     model = arch_model(
         returns,
         vol="GARCH",
-        p=1,
-        q=1,
+        p=GARCH_P,
+        q=GARCH_Q,
         mean="Constant",
         dist="t",
     )
@@ -95,30 +129,54 @@ def forecast_volatility(result, horizon: int) -> pd.Series:
 
 
 def classify_vol_regime(result, horizon: int = 1) -> Tuple[str, float]:
-    # label vol regime using percentiles
+    # label vol regime using relative vol vs median
     cond_vol = pd.Series(result.conditional_volatility)
-    low_p = cond_vol.quantile(0.2)
-    high_p = cond_vol.quantile(0.8)
+    median_vol = cond_vol.median()
     forecast = result.forecast(horizon=horizon, reindex=False)
     var_series = forecast.variance.iloc[-1]
     forecast_vol = float(var_series.iloc[-1] ** 0.5)
 
-    if forecast_vol < low_p:
+    v_rel = forecast_vol / median_vol if median_vol > 0 else 1.0
+    if v_rel <= VOL_LOW_REL:
         regime = "low"
-    elif forecast_vol > high_p:
+    elif v_rel >= VOL_HIGH_REL:
         regime = "high"
     else:
-        regime = "normal"
+        regime = "medium"
     return regime, forecast_vol
 
 
-def target_weight_from_regime(regime: str) -> float:
-    # map regime to portfolio weight
-    if regime == "low":
-        return 0.02
-    if regime == "normal":
-        return 0.01
-    return 0.0
+def mean_reversion_weight(price_df: pd.DataFrame, max_weight: float = 0.02) -> float:
+    # mean reversion using 20d z-score
+    close = price_df["close"].astype(float)
+    sma = close.rolling(MR_LOOKBACK).mean()
+    std = close.rolling(MR_LOOKBACK).std()
+    if pd.isna(sma.iloc[-1]) or pd.isna(std.iloc[-1]) or std.iloc[-1] == 0:
+        return 0.0
+    z = (close.iloc[-1] - sma.iloc[-1]) / std.iloc[-1]
+    return max_weight if z < MR_Z else 0.0
+
+
+def momentum_weight(price_df: pd.DataFrame, max_weight: float = 0.01) -> float:
+    # trend follow with MACD plus SMA50 filter
+    close = price_df["close"].astype(float)
+    macd = close.ewm(span=MOM_FAST).mean() - close.ewm(span=MOM_SLOW).mean()
+    signal = macd.ewm(span=MOM_SIGNAL).mean()
+    sma = close.rolling(TREND_SMA).mean()
+    if pd.isna(macd.iloc[-1]) or pd.isna(signal.iloc[-1]) or pd.isna(sma.iloc[-1]):
+        return 0.0
+    cond = macd.iloc[-1] > signal.iloc[-1] and close.iloc[-1] > sma.iloc[-1]
+    return max_weight if cond else 0.0
+
+
+def target_weight_from_regime(regime: str, price_df: pd.DataFrame) -> float:
+    # tie regime to sizing style
+    if regime == "high":  # risk-off
+        return 0.0
+    if regime == "medium":  # medium vol -> momentum
+        return momentum_weight(price_df, max_weight=WEIGHT_MED)
+    # low vol -> mean reversion
+    return mean_reversion_weight(price_df, max_weight=WEIGHT_LOW)
 
 
 def build_vol_signals_for_universe(symbols) -> Dict[str, float]:
@@ -141,7 +199,7 @@ def build_vol_signals_for_universe(symbols) -> Dict[str, float]:
             returns = compute_returns(price_df, column="close") * scale
             _, result = fit_garch_model(returns)
             regime, forecast_vol = classify_vol_regime(result, horizon=1)
-            weight = target_weight_from_regime(regime)
+            weight = target_weight_from_regime(regime, price_df)
             signals[symbol] = weight
             print(f"{symbol}: regime={regime}, fvol={forecast_vol:.6f}, weight={weight:.4f}")
         except Exception as exc:
